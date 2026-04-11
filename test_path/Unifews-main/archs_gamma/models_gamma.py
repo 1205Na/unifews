@@ -3,11 +3,42 @@ os.environ['TL_BACKEND'] = 'torch'
 
 import tensorlayerx as tlx
 import tensorlayerx.nn as nn
+from .prunes_gamma import prune, rewind, ThrInPrune, ThrProdPrune
+
+# 【已修复·无assign·纯TLX兼容】BatchNorm重置函数
+def reset_bn_(bn_module):
+    """
+    纯TLX实现：重置BatchNorm1d参数
+    复用run_mb_gamma.py亲测稳定的 .data 赋值方式，无assign报错
+    """
+    if bn_module is None:
+        return
+
+    # 重置 gamma (weight) = 1 → 用 .data 赋值（亲测可用）
+    if hasattr(bn_module, 'weight') and bn_module.weight is not None:
+        new_gamma = tlx.initializers.Ones()(bn_module.weight.shape)
+        bn_module.weight.data = new_gamma
+
+    # 重置 beta (bias) = 0 → 用 .data 赋值
+    if hasattr(bn_module, 'bias') and bn_module.bias is not None:
+        new_beta = tlx.initializers.Zeros()(bn_module.bias.shape)
+        bn_module.bias.data = new_beta
+
+    # 重置 moving_mean = 0 → 用 .data 赋值
+    if hasattr(bn_module, 'moving_mean') and bn_module.moving_mean is not None:
+        new_mean = tlx.initializers.Zeros()(bn_module.moving_mean.shape)
+        bn_module.moving_mean.data = new_mean
+
+    # 重置 moving_var = 1 → 用 .data 赋值
+    if hasattr(bn_module, 'moving_var') and bn_module.moving_var is not None:
+        new_var = tlx.initializers.Ones()(bn_module.moving_var.shape)
+        bn_module.moving_var.data = new_var
+        
 # IMPORT YOUR CUSTOM FUNCTIONS HERE:
 from .layers_gamma import (
     layer_dict, ThrInPrune, LayerNumLogger, rewind, 
     reset_weight_, reset_bias_, 
-    gcn_norm, add_remaining_self_loops  # <-- Added your normalization functions
+    gcn_norm, add_remaining_self_loops
 )
 
 kwargs_default = {
@@ -94,18 +125,12 @@ class GNNThr(nn.Module):
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
 
-        # ====================================================================
-        # [ACCURACY FIX] Extract graph operation flags into class attributes.
-        # This prevents GammaGL's __init__ from crashing while allowing us 
-        # to process the graph mathematically exactly like PyG would.
-        # ====================================================================
         self.depth_inv = self.kwargs.pop('depth_inv', False)
         self.normalize_adj = self.kwargs.pop('normalize', False)
         self.add_self_loops = self.kwargs.pop('add_self_loops', False)
         self.cached = self.kwargs.pop('cached', False)
         
         conv_kwargs = self.kwargs.copy()
-        # Remove remainder args that standard GammaGL Convs don't support
         for k in ['improved', 'rnorm', 'diag']:
             conv_kwargs.pop(k, None)
 
@@ -124,24 +149,17 @@ class GNNThr(nn.Module):
             if hasattr(conv, 'reset_parameters'):
                 conv.reset_parameters()
         
-        # 2. Reset Normalization Layers Safely
+        # 2. Reset Normalization Layers（调用本文件内的 reset_bn_）
         for norm in self.norms:
             if hasattr(norm, 'reset_parameters'):
-                # If the norm layer (like LayerNorm) HAS the method, use it
                 norm.reset_parameters()
             elif 'BatchNorm' in type(norm).__name__:
-                # If it's a TLX BatchNorm, use our manual reset helper
-                from .layers_gamma import reset_bn_
                 reset_bn_(norm)
 
-    # ====================================================================
-    # [NEW GRAPH PROCESSOR] Dynamically applies your layer_gamma.py functions
-    # ====================================================================
     def _process_graph(self, x, edge_idx):
         if not (self.normalize_adj or self.add_self_loops):
             return edge_idx
             
-        # Unpack tuple if it came from identity_n_norm
         if isinstance(edge_idx, (tuple, list)):
             edge_index, edge_weight = edge_idx[0], edge_idx[1]
         else:
@@ -149,7 +167,6 @@ class GNNThr(nn.Module):
 
         num_nodes = x.shape[0]
 
-        # Apply your exact functional logic
         if self.normalize_adj:
             edge_index, edge_weight = gcn_norm(
                 edge_index, edge_weight, num_nodes, 
@@ -163,10 +180,8 @@ class GNNThr(nn.Module):
         return (edge_index, edge_weight)
 
     def forward(self, x, edge_idx, node_lock=tlx.convert_to_tensor([]), verbose=False):
-        # 1. Manually route edges through your custom PyG-equivalent math
         edge_idx = self._process_graph(x, edge_idx)
         
-        # 2. Proceed with normal forward pass
         if self.apply_thr:
             for i, conv in enumerate(self.convs[:-1]):
                 x, edge_idx = conv(x, edge_idx, node_lock=node_lock, verbose=verbose)
@@ -211,12 +226,13 @@ class GNNThr(nn.Module):
         self.apply(lambda m: set_attr(m, 'scheme_a', scheme_a))
         self.apply(lambda m: set_attr(m, 'scheme_w', scheme_w))
 
+    # 【2/4 核心修改】修复剪枝移除：'weight' → 'weights'
     def remove(self):
         for conv in self.convs:
             if hasattr(conv, 'prune_lst'):
                 for m in conv.prune_lst:
-                    if tlx.nn.utils.prune.is_pruned(m):
-                        tlx.nn.utils.prune.remove(m, 'weight')
+                    if prune.is_pruned(m):
+                        prune.remove(m, 'weights')
 
     def get_numel(self):
         numel_a = sum(c.logger_a.numel_after for c in self.convs)
@@ -231,7 +247,7 @@ class GNNThr(nn.Module):
 
 class GNNLPThr(GNNThr):
     def __init__(self, nlayer, nfeat, nhidden, nclass, thr_a=0.0, thr_w=0.0, dropout=0.0, layer='gcn', **kwargs):
-        super().__init__(nlayer, nfeat, nhidden, nhidden, thr_a, thr_w, dropout, layer,** kwargs)
+        super().__init__(nlayer, nfeat, nhidden, nhidden, thr_a, thr_w, dropout, layer, **kwargs)
         self.lin_out = nn.ModuleList([
             nn.Linear(nhidden, nhidden),
             nn.Linear(nhidden, nhidden),
@@ -266,8 +282,8 @@ class SandwitchThr(GNNThr):
         reset_weight_(self.lin_out.weights, self.lin_out.in_features, initializer='kaiming_uniform')
         reset_bias_(self.lin_out.biases, self.lin_out.in_features, initializer='uniform')
 
+    # 【3/4 核心修改】修复传参：删除多余的 x，适配所有卷积层
     def forward(self, x, edge_idx, node_lock=tlx.convert_to_tensor([]), verbose=False):
-        # 1. Process edges through your PyG math equivalence
         edge_idx = self._process_graph(x, edge_idx)
         
         x = self.lin_in(x)
@@ -278,20 +294,20 @@ class SandwitchThr(GNNThr):
 
         if self.apply_thr:
             for i, conv in enumerate(self.convs[:-1]):
-                x, edge_idx = conv(x, x, edge_idx, node_lock=node_lock, verbose=verbose)
+                x, edge_idx = conv(x, edge_idx, node_lock=node_lock, verbose=verbose)
                 if self.use_bn:
                     x = self.norms[i](x)
                 x = self.act(x)
                 x = self.dropout(x)
-            x, _ = self.convs[-1](x, x, edge_idx, node_lock=node_lock, verbose=verbose)
+            x, _ = self.convs[-1](x, edge_idx, node_lock=node_lock, verbose=verbose)
         else:
             for i, conv in enumerate(self.convs[:-1]):
-                x = conv(x, x, edge_idx)
+                x = conv(x, edge_idx)
                 if self.use_bn:
                     x = self.norms[i](x)
                 x = self.act(x)
                 x = self.dropout(x)
-            x = self.convs[-1](x, x, edge_idx)
+            x = self.convs[-1](x, edge_idx)
         return self.lin_out(x)
 
 class MLP(nn.Module):

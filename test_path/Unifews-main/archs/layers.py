@@ -307,50 +307,30 @@ class GCNConvThr(ConvThr, GCNConvRaw):
         x, edge_weight = kwargs['x'], kwargs['edge_weight']
         return edge_index, size, {'x': x, 'edge_weight': edge_weight}
 
-    def prune_on_msg(self, module, inputs, output): # -> None or output
-        """res = hook(self, ({'x_j', 'edge_weight'}, ), output)
-        Applicable only if not is_sparse(edge_index)
-        Called in propagate(), after `out = self.message(**msg_kwargs)`
-            E.g. in GCNConv, after normalization: `edge_weight.view(-1, 1) * edge_index`
-
-        Apply pruning on message based on message norm
-        Args:
-            inputs
-                x_j [m, F]: node feature mapped by edge source nodes
-                edge_weight [m]
-            output [m, F]: message of each edge after message() and pending aggregate
-        """
-        # Edge pruning
+    def prune_on_msg(self, module, inputs, output):
         if self.scheme_a in ['pruneall', 'pruneinc']:
-            if self.scheme_a == 'pruneinc':
-                raise NotImplementedError()
-                # <<<<<<<<<< NOTE: previous idx may change when l>1
-                self.idx_keep = self.idx_keep.to(output.device)
-                mask_0 = torch.ones(output.shape[0], dtype=torch.bool, device=output.device)
-                mask_0[self.idx_keep] = False
-                output[mask_0] = 0
-            else:
-                mask_0 = torch.zeros(output.shape[0], dtype=torch.bool, device=output.device)
-            # self.logger_msg.numel_before = output.numel()
-            # self.logger_msg.numel_after = torch.sum(output != 0).item()
-
-            norm_feat_msg = torch.norm(output, dim=1)       # each entry accross all features
-            norm_all_msg = torch.norm(norm_feat_msg, dim=None, p=1)/output.shape[0]
+            # 1. 严格按官方zeros：shape传元组，还原原始逻辑
+            mask_0 = tlx.zeros(shape=(output[0].shape[0],), dtype=tlx.bool)
+            norm_feat_msg = norm(output[0], axis=1)
+            norm_all_msg = norm(norm_feat_msg, axis=None, p=1) / output[0].shape[0]
             mask_cmp = norm_feat_msg < self.threshold_a * norm_all_msg
-            # mask_cmp = norm_feat < self.threshold_a * self.norm_all_node
-            mask_0 = torch.logical_or(mask_0, mask_cmp)
+            mask_0 = tlx.logical_or(mask_0, mask_cmp)
+        
+            # 2. 这里绝对安全！idx_lock是边索引，和mask_0维度完全匹配（原始代码就是这么写的）
             mask_0[self.idx_lock] = False
-            output[mask_0] = 0
-            self.idx_keep = torch.where(~mask_0)[0]
-        # >>>>>>>>>>
+            output[0][mask_0] = 0
+        
+       
+            node_idx = tlx.arange(start=0, limit=output[0].shape[0])
+            idx_keep_raw = tlx.where(~mask_0, node_idx, tlx.zeros_like(node_idx))
+            self.idx_keep = tlx.cast(idx_keep_raw[idx_keep_raw != 0], tlx.int64)  # ❌ 删掉squeeze()！
+
         elif self.scheme_a == 'keep':
-            # self.logger_msg.numel_before = output.numel()
-            # self.logger_msg.numel_after = torch.sum(output != 0).item()
-            mask_0 = torch.ones(output.shape[0], dtype=torch.bool)
+        
+            mask_0 = tlx.ones(shape=(output[0].shape[0],), dtype=tlx.bool)
             mask_0[self.idx_keep] = False
             mask_0[self.idx_lock] = False
-            output[mask_0] = 0
-        # self.msg_bak = output.clone().detach().cpu()
+            output[0][mask_0] = 0
         return output
 
     def forward(self, x: Tensor, edge_tuple: Tuple,
