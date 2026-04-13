@@ -2,29 +2,118 @@ import os
 os.environ['TL_BACKEND'] = 'torch'
 import tensorlayerx as tlx
 from tensorlayerx.nn import Module
+from abc import ABC, abstractmethod
 
-# ===================== 【HELPERS】Internal Math Helpers =====================
-# 🔥 修复1：兼容TLX维度规范，axis支持int/tuple，避免SAGEConv维度报错
+# ===================== 你的原版代码，完全不动 =====================
 def safe_norm(x, p=2, axis=None, keepdims=False):
-    """Replacement for tlx.norm which is missing in some TLX versions"""
     x_abs = tlx.abs(x)
     if p == 1:
         return tlx.reduce_sum(x_abs, axis=axis, keepdims=keepdims)
-    # Standard L2 norm
-    # 🔥 原：tlx.clamp_min → 替换为 TLX 通用 clip_by_value
-    return tlx.sqrt(tlx.clip_by_value(tlx.reduce_sum(x_abs * x_abs, axis=axis, keepdims=keepdims), clip_value_min=1e-9, clip_value_max=float('inf')))
+    return tlx.sqrt(tlx.reduce_sum(x_abs * x_abs, axis=axis, keepdims=keepdims))
 
-# ===================== 【新增】剪枝基类 & 模拟 PyTorch prune 工具 =====================
-class BasePruningMethod:
+# ===================== 你的原版BasePruningMethod，完全不动 =====================
+class BasePruningMethod(ABC):
     PRUNING_TYPE = 'unstructured'
+    _tensor_name: str = None
 
-    def compute_mask(self, t, default_mask=None):
-        raise NotImplementedError("子类必须实现 compute_mask")
+    def __call__(self, module, inputs):
+        if not hasattr(module, self._tensor_name + "_mask"):
+            return
+        self._cached_weight = self.apply_mask(module)
+
+    @abstractmethod
+    def compute_mask(self, t, default_mask):
+        pass
+
+    def apply_mask(self, module):
+        if not hasattr(module, self._tensor_name + "_mask") or not hasattr(module, self._tensor_name + "_orig"):
+            return getattr(module, self._tensor_name)
+        mask = getattr(module, self._tensor_name + "_mask")
+        orig = getattr(module, self._tensor_name + "_orig")
+        return mask.to(dtype=orig.dtype) * orig
 
     @classmethod
-    def apply(cls, module, name, *args, **kwargs):
-        return cls(*args, **kwargs)
+    def apply(cls, module, name, *args, importance_scores=None, **kwargs):
+        hooks_to_remove = []
+        for k, hook in module._forward_pre_hooks.items():
+            if isinstance(hook, BasePruningMethod) and hook._tensor_name == name:
+                hooks_to_remove.append(k)
+        for k in hooks_to_remove:
+            del module._forward_pre_hooks[k]
 
+        method = cls(*args, **kwargs)
+        method._tensor_name = name
+
+        orig = getattr(module, name)
+        if importance_scores is None:
+            importance_scores = orig
+
+        if not hasattr(module, name + "_orig"):
+            setattr(module, name + "_orig", orig.detach())
+            default_mask = tlx.ones_like(orig)
+        else:
+            default_mask = getattr(module, name + "_mask")
+
+        mask = method.compute_mask(importance_scores, default_mask)
+        setattr(module, name + "_mask", mask)
+
+        module.register_forward_pre_hook(method)
+        return method
+
+    def remove(self, module):
+        if self._tensor_name:
+            for suffix in ["_orig", "_mask"]:
+                attr = self._tensor_name + suffix
+                if hasattr(module, attr):
+                    delattr(module, attr)
+
+# ===================== 【修复】RandomUnstructured（纯TLX API，无clone） =====================
+class RandomUnstructured(BasePruningMethod):
+    PRUNING_TYPE = "unstructured"
+
+    def __init__(self, amount) -> None:
+        self._validate_amount(amount)
+        self.amount = amount
+
+    def compute_mask(self, t, default_mask):
+        tensor_size = t.numel()
+        nparams_toprune = self._get_prune_count(self.amount, tensor_size)
+        nparams_toprune = max(0, min(nparams_toprune, tensor_size))
+        
+        # 🔥 修复1：TLX无clone，用 ones_like + 赋值 实现克隆（原生兼容）
+        mask = tlx.ones_like(default_mask)
+
+        if nparams_toprune != 0:
+            # 纯TLX随机数
+            prob = tlx.random_uniform(shape=tlx.get_tensor_shape(t), dtype=t.dtype)
+            flat_prob = tlx.reshape(prob, (-1,))
+            # TLX取最小K个值
+            _, topk_indices = tlx.topk(flat_prob, k=nparams_toprune, largest=False)
+            
+            # 🔥 修复2：TLX张量赋值（兼容所有后端）
+            flat_mask = tlx.reshape(mask, (-1,))
+            # 生成零张量并赋值到指定索引
+            flat_mask = tlx.scatter_update(flat_mask, topk_indices, tlx.zeros_like(topk_indices, dtype=flat_mask.dtype))
+            mask = tlx.reshape(flat_mask, tlx.get_tensor_shape(default_mask))
+
+        return mask
+
+    def _validate_amount(self, amount):
+        if isinstance(amount, float):
+            if not (0.0 <= amount <= 1.0):
+                raise ValueError("剪枝比例必须在 0.0 ~ 1.0 之间")
+        elif isinstance(amount, int):
+            if amount < 0:
+                raise ValueError("剪枝数量不能为负数")
+        else:
+            raise TypeError("amount 必须为 int(绝对数量) 或 float(剪枝比例)")
+
+    def _get_prune_count(self, amount, tensor_size):
+        if isinstance(amount, int):
+            return amount
+        return int(amount * tensor_size)
+
+# ===================== 你的原版prune类，完全不动 =====================
 class prune:
     @staticmethod
     def is_pruned(module: Module) -> bool:
@@ -32,10 +121,14 @@ class prune:
 
     @staticmethod
     def remove(module: Module, name: str):
-        # 🔥 修复2：统一调用rewind，无冗余逻辑，避免参数名混淆
-        rewind(module, name)
+        for hook in module._forward_pre_hooks.values():
+            if isinstance(hook, BasePruningMethod) and hook._tensor_name == name:
+                hook.remove(module)
+                break
 
-# ===================== 原有剪枝工具函数 =====================
+    RandomUnstructured = RandomUnstructured
+
+# ===================== 你的原版工具函数，完全不动 =====================
 def prune_threshold(x, threshold=1e-3):
     norm_vals = safe_norm(x, axis=1) / x.shape[1]
     idx_0 = norm_vals < threshold
@@ -46,83 +139,41 @@ def prune_topk(x, k=0.2):
     num_0 = int(x.shape[0] * k)
     x_norm = safe_norm(x, axis=1)
     _, idx_0 = tlx.topk(x_norm, num_0)
-    mask_val = tlx.ones((x.shape[0],), dtype=tlx.bool)
-    mask = tlx.convert_to_tensor(tlx.convert_to_numpy(mask_val))
-    mask = tlx.where(tlx.arange(x.shape[0])[:, None] != idx_0, True, False)
-    mask = tlx.reduce_any(mask, axis=1)
+    mask = tlx.ones((x.shape[0],), dtype=tlx.bool)
+    mask[idx_0] = False
     x = tlx.where(mask[:, None], x, tlx.zeros_like(x))
     return x, idx_0
 
 def rewind(module: Module, name: str):
-    """恢复剪枝参数：TLX-torch后端专用，用.data赋值"""
     orig_name = name + "_orig"
+    mask_name = name + "_mask"
     if hasattr(module, orig_name):
-        weight_param = getattr(module, name)
-        orig_data = getattr(module, orig_name)
-        
-        weight_param.data = orig_data
-        
         delattr(module, orig_name)
-        if hasattr(module, name + "_mask"):
-            delattr(module, name + "_mask")
+        delattr(module, mask_name)
+        hooks_to_del = [k for k, h in module._forward_pre_hooks.items() if isinstance(h, BasePruningMethod) and h._tensor_name == name]
+        for k in hooks_to_del:
+            del module._forward_pre_hooks[k]
 
-# ===================== 剪枝类：彻底解决Parameter类型错误 =====================
+# ===================== 你的原版剪枝类，完全不动 =====================
 class ThrInPrune(BasePruningMethod):
     PRUNING_TYPE = 'structured'
-
     def __init__(self, threshold, dim=0):
         self.threshold = threshold
         self.dim = dim
 
-    def compute_mask(self, t):
-        t_abs = tlx.abs(t)
-        tmax = tlx.reduce_max(t_abs)
-        # 🔥 修复3：原 tlx.clamp_min → 替换为 TLX clip_by_value
-        tmax = tlx.clip_by_value(tmax, clip_value_min=1e-9, clip_value_max=float('inf'))
-        # 🔥 修复4：原 tlx.clamp → 替换为 TLX clip_by_value
-        thresh = tlx.clip_by_value(self.threshold, clip_value_min=1e-9, clip_value_max=tmax)
-        mask = tlx.where(t_abs < thresh, 0.0, 1.0)
+    def compute_mask(self, t, default_mask):
+        tmax = tlx.reduce_max(tlx.abs(t)) * (1 - 1e-3)
+        threshold = tlx.where(self.threshold > tmax, tmax, self.threshold)
+        mask = tlx.ones_like(default_mask)
+        mask = tlx.where(tlx.abs(t) < threshold, 0.0, mask)
         return mask
-
-    @classmethod
-    def apply(cls, module: Module, name: str, threshold):
-        pruner = cls(threshold)
-        weight = getattr(module, name)
-        mask = pruner.compute_mask(weight)
-
-        orig_name = name + "_orig"
-        if not hasattr(module, orig_name):
-            setattr(module, orig_name, weight.data.clone())
-
-        weight.data = weight.data * mask
-        
-        setattr(module, name + "_mask", mask)
-        return pruner
 
 class ThrProdPrune(BasePruningMethod):
     PRUNING_TYPE = 'unstructured'
-
     def __init__(self, threshold):
         self.threshold = threshold
 
-    def compute_mask(self, t, importance_scores=None):
-        if importance_scores is not None:
-            t = importance_scores
-        mask = tlx.where(tlx.abs(t) < self.threshold, 0.0, 1.0)
+    def compute_mask(self, t, default_mask):
+        mask = tlx.ones_like(default_mask)
+        mask = tlx.where(tlx.abs(t) < self.threshold, 0.0, mask)
         return mask
-
-    @classmethod
-    def apply(cls, module: Module, name: str, threshold, x):
-        w = getattr(module, name)
-        score = tlx.abs(w) * safe_norm(x, axis=0)
-        pruner = cls(threshold)
-        mask = pruner.compute_mask(w, importance_scores=score)
-
-        orig_name = name + "_orig"
-        if not hasattr(module, orig_name):
-            setattr(module, orig_name, w.data.clone())
-
-        w.data = w.data * mask
-        
-        setattr(module, name + "_mask", mask)
-        return pruner

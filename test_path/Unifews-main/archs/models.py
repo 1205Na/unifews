@@ -31,6 +31,7 @@ kwargs_default = {
         'rnorm': None,
         'diag': 1.,
         'depth_inv': False,
+        
     },
     'gcn2': {
         'alpha': 0.1,

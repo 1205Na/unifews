@@ -345,7 +345,10 @@ class DataProcess(object):
                 self.adj_matrix = self.adj_matrix.tocsr()
                 # assert self.adj_matrix.diagonal().sum() == 0, "adj_matrix error"
             elif key == 'deg':
-                self.deg = dict(np.load(self.degree_path))['arr_0']
+                #self.deg = dict(np.load(self.degree_path))['arr_0']
+                # 替换你第 348~349 行左右的 deg 读取代码
+                data = np.load(self.degree_path, allow_pickle=True)
+                self.deg = data[next(iter(data.keys()))]
             elif key == 'labels':
                 self.labels = dict(np.load(self.labels_path, allow_pickle=True))['labels']
                 # assert (self.labels.dim()==2 and self.labels.shape[1]==1) or self.labels.dim()==1, "label shape error"
@@ -499,3 +502,4 @@ if __name__ == '__main__':
     dp.calculate(['deg', 'idx_train'])
     dp.output(['deg', 'query'])
     print(dp)
+
