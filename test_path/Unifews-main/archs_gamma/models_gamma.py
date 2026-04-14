@@ -101,6 +101,80 @@ def set_attr(module, key, value):
     if hasattr(module, key):
         setattr(module, key, value)
 
+class SandwitchGCNII(nn.Module):
+    def __init__(self, nlayer, nfeat, nhidden, nclass, alpha, beta, 
+                 thr_a=0.0, thr_w=0.0, dropout=0.0, variant=False, layer='gcn2', **kwargs):
+        super().__init__()
+        self.nfeat = nfeat
+        self.nhidden = nhidden
+        self.nclass = nclass
+        self.act = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+        self.use_bn = True
+        
+        # 1. 投影层
+        self.lin_in = nn.Linear(in_features=nfeat, out_features=nhidden)
+        self.lin_out = nn.Linear(in_features=nhidden, out_features=nclass)
+        
+        for lin in [self.lin_in, self.lin_out]:
+            object.__setattr__(lin, 'act', lambda x: x)
+
+        # 2. 动态选择卷积层类型 (关键修复：不再硬编码 'gcn2')
+        Conv = layer_dict[layer] 
+        
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        
+        thr_a = [thr_a] * nlayer if not isinstance(thr_a, list) else thr_a
+        thr_w = [thr_w] * nlayer if not isinstance(thr_w, list) else thr_w
+
+        for i in range(nlayer):
+            self.convs.append(Conv(
+                in_channels=nhidden, 
+                out_channels=nhidden, 
+                alpha=alpha, 
+                beta=beta, 
+                variant=variant,
+                thr_a=thr_a[i], 
+                thr_w=thr_w[i]
+            ))
+            self.norms.append(nn.BatchNorm1d(num_features=nhidden, momentum=0.1))
+
+    def reset_parameters(self):
+        if not hasattr(self.lin_in, 'weights'): self.lin_in.build((None, self.nfeat))
+        reset_weight_(self.lin_in.weights, self.nfeat)
+        reset_bias_(self.lin_in.biases, self.nfeat)
+        
+        if not hasattr(self.lin_out, 'weights'): self.lin_out.build((None, self.nhidden))
+        reset_weight_(self.lin_out.weights, self.nhidden)
+        reset_bias_(self.lin_out.biases, self.nhidden)
+            
+        for conv in self.convs:
+            if hasattr(conv, 'reset_parameters'): conv.reset_parameters()
+        for norm in self.norms:
+            reset_bn_(norm)
+
+    def forward(self, x, edge_idx, **kwargs):
+        # 默认 forward 不包含复杂的剪枝逻辑，由子类重写
+        x = self.lin_in(x)
+        x = x_0 = self.act(x)
+        x = self.dropout(x)
+        for i, conv in enumerate(self.convs):
+            x = conv(x, x_0, edge_idx)
+            if self.use_bn: x = self.norms[i](x)
+            x = self.act(x)
+            x = self.dropout(x)
+        return self.lin_out(x)
+
+    def set_scheme(self, scheme_a, scheme_w):
+        self.apply(lambda m: set_attr(m, 'scheme_a', scheme_a))
+        self.apply(lambda m: set_attr(m, 'scheme_w', scheme_w))
+
+    def get_numel(self):
+        numel_a = sum(c.logger_a.numel_after for c in self.convs if hasattr(c, 'logger_a'))
+        numel_w = sum(c.logger_w.numel_after for c in self.convs if hasattr(c, 'logger_w'))
+        return numel_a/1e3, numel_w/1e3
+
 class GNNThr(nn.Module):
     def __init__(self, nlayer, nfeat, nhidden, nclass, thr_a=0.0, thr_w=0.0, dropout=0.0, layer='gcn', **kwargs):
         super().__init__()
@@ -129,13 +203,13 @@ class GNNThr(nn.Module):
         thr_a = [thr_a] * nlayer if not isinstance(thr_a, list) else thr_a
         thr_w = [thr_w] * nlayer if not isinstance(thr_w, list) else thr_w
 
-        # 2. 🔥 修复1：中间层参数 → GAT保留 heads/concat，其他模型清理
+        # 中间层参数 → GAT保留 heads/concat，其他模型清理
         self.depth_inv = self.kwargs.pop('depth_inv', False)
         self.normalize_adj = self.kwargs.pop('normalize', False)
         self.add_self_loops = self.kwargs.pop('add_self_loops', False)
         self.cached = self.kwargs.pop('cached', False)
         
-        # 🔴 关键：只清理非注意力参数，GAT保留 heads/concat
+        # 只清理非注意力参数，GAT保留 heads/concat
         self.mid_kwargs = self.kwargs.copy()
         for k in ['improved', 'rnorm', 'diag']:
             self.mid_kwargs.pop(k, None)
@@ -269,51 +343,82 @@ class GNNLPThr(GNNThr):
             x = self.dropout(x)
         return self.lin_out[-1](x)
 
-class SandwitchThr(GNNThr):
-    def __init__(self, nlayer, nfeat, nhidden, nclass, thr_a=0.0, thr_w=0.0, dropout=0.0, layer='gcn', **kwargs):
-        super().__init__(nlayer, nhidden, nhidden, nhidden, thr_a, thr_w, dropout, layer, **kwargs)
-        self.lin_in = nn.Linear(nfeat, nhidden)
-        self.lin_out = nn.Linear(nhidden, nclass)
-        # 🔥 修复：适配GAT多头
-        heads = kwargs.get('heads', 1)
-        concat = kwargs.get('concat', True)
-        actual_hidden = heads * nhidden if concat else nhidden
-        self.norms.append(nn.BatchNorm1d(num_features=actual_hidden, momentum=0.1))
+class SandwitchThr(SandwitchGCNII):
+    def __init__(self, nlayer, nfeat, nhidden, nclass,
+                 thr_a=0.0, thr_w=0.0, dropout: float = 0.0, layer: str = 'gcn2_thr',
+                 **kwargs):
+        
+        alpha = kwargs.get('alpha', 0.1)
+        beta = kwargs.get('beta', 0.5)
+        variant = kwargs.get('variant', False)
+        
+        # 显式传递 layer 参数，父类会根据此参数加载 GCNIIConvThr
+        super().__init__(nlayer=nlayer, nfeat=nfeat, nhidden=nhidden, nclass=nclass, 
+                         alpha=alpha, beta=beta, thr_a=thr_a, thr_w=thr_w, 
+                         dropout=dropout, variant=variant, layer=layer, **kwargs)
+        
+        self.apply_thr = '_' in layer
+        self.normalize_adj = kwargs.get('normalize', False)
+        self.add_self_loops = kwargs.get('add_self_loops', False)
 
-    def reset_parameters(self):
-        super().reset_parameters()
-        reset_weight_(self.lin_in.weights, self.lin_in.in_features, initializer='kaiming_uniform')
-        reset_bias_(self.lin_in.biases, self.lin_in.in_features, initializer='uniform')
-        reset_weight_(self.lin_out.weights, self.lin_out.in_features, initializer='kaiming_uniform')
-        reset_bias_(self.lin_out.biases, self.lin_out.in_features, initializer='uniform')
+    def _process_graph(self, x, edge_idx):
+        if not (self.normalize_adj or self.add_self_loops):
+            return edge_idx
+        edge_index, edge_weight = edge_idx if isinstance(edge_idx, (tuple, list)) else (edge_idx, None)
+        num_nodes = x.shape[0]
+        if self.normalize_adj:
+            edge_index, edge_weight = gcn_norm(edge_index, edge_weight, num_nodes, add_self_loops=self.add_self_loops, dtype=x.dtype)
+        elif self.add_self_loops:
+            edge_index, edge_weight = add_remaining_self_loops(edge_index, edge_weight, num_nodes=num_nodes)
+        return (edge_index, edge_weight)
 
-    # 【3/4 核心修改】修复传参：删除多余的 x，适配所有卷积层
     def forward(self, x, edge_idx, node_lock=tlx.convert_to_tensor([]), verbose=False):
         edge_idx = self._process_graph(x, edge_idx)
         
         x = self.lin_in(x)
-        if self.use_bn:
-            x = self.norms[-1](x)
-        x = self.act(x)
+        x = x_0 = self.act(x)
         x = self.dropout(x)
 
         if self.apply_thr:
-            for i, conv in enumerate(self.convs[:-1]):
-                x, edge_idx = conv(x, edge_idx, node_lock=node_lock, verbose=verbose)
-                if self.use_bn:
-                    x = self.norms[i](x)
+            for i, conv in enumerate(self.convs):
+                # 此时 conv 是 GCNIIConvThr，支持 node_lock
+                x, edge_idx = conv(x, x_0, edge_idx, node_lock=node_lock, verbose=verbose)
+                if self.use_bn: x = self.norms[i](x)
                 x = self.act(x)
                 x = self.dropout(x)
-            x, _ = self.convs[-1](x, edge_idx, node_lock=node_lock, verbose=verbose)
         else:
-            for i, conv in enumerate(self.convs[:-1]):
-                x = conv(x, edge_idx)
-                if self.use_bn:
-                    x = self.norms[i](x)
+            for i, conv in enumerate(self.convs):
+                x = conv(x, x_0, edge_idx)
+                if self.use_bn: x = self.norms[i](x)
                 x = self.act(x)
                 x = self.dropout(x)
-            x = self.convs[-1](x, edge_idx)
-        return self.lin_out(x)
+
+        x = self.lin_out(x)
+        return x
+
+    def remove(self):
+        for conv in self.convs:
+            if hasattr(conv, 'prune_lst'):
+                for m in conv.prune_lst:
+                    if prune.is_pruned(m): prune.remove(m, 'weights')
+
+    def get_repre(self, x, edge_idx, layer=None, node_lock=tlx.convert_to_tensor([]), verbose=False):
+        layer = layer or len(self.convs)
+        edge_idx = self._process_graph(x, edge_idx)
+        
+        x = self.lin_in(x)
+        x = x_0 = self.act(x)
+        x = self.dropout(x)
+
+        for i, conv in enumerate(self.convs[:layer]):
+            if self.apply_thr:
+                x, edge_idx = conv(x, x_0, edge_idx, node_lock=node_lock, verbose=verbose)
+            else:
+                x = conv(x, x_0, edge_idx)
+            if self.use_bn: x = self.norms[i](x)
+            x = self.act(x)
+            x = self.dropout(x)
+        return x
 
 class MLP(nn.Module):
     def __init__(self, nlayer, nfeat, nhidden, nclass, dropout, thr_w=0.0, layer='sgc'):
