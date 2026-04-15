@@ -3,12 +3,11 @@ os.environ['TL_BACKEND'] = 'torch'
 import json
 import numpy as np
 import scipy.sparse as sp
-# 替换为 GammaGL 数据集（兼容TensorLayerX）
+
 import gammagl.datasets as ggl_ds
 import gammagl.transforms as ggl_t
 import gammagl.utils as ggl_utils
 
-# 继承你原有的基础数据处理类（无需修改）
 from data_processor import *
 
 
@@ -23,7 +22,7 @@ class DataProcess_OGB(DataProcess):
         return len(self.idx_train)
 
     def fetch(self):
-        # ============== 原版：OGB → 重写为 GammaGL OGB 接口 ==============
+       
         dataset = ggl_ds.OGB(self.name, root='/share/data/dataset/OGB')
         split_idx = dataset.get_idx_split()
         idx_train, idx_val, idx_test = split_idx["train"], split_idx["valid"], split_idx["test"]
@@ -36,7 +35,6 @@ class DataProcess_OGB(DataProcess):
         if len(idx_zero) > 0:
             print(f"Warning: removing {len(idx_zero)} isolated nodes: {idx_zero}!")
 
-        # 移除孤立节点（逻辑完全不变）
         nodelst = deg.nonzero()[0]
         idxnew = np.full(graph.num_nodes, -1)
         idxnew[nodelst] = np.arange(len(nodelst))
@@ -49,7 +47,7 @@ class DataProcess_OGB(DataProcess):
         assert (labels.ndim==2 and labels.shape[1]==1) or labels.ndim==1, "label shape error"
         self.labels = labels.numpy().flatten()[nodelst]
 
-        # 索引处理（逻辑完全不变）
+        
         self.idx_train = idxnew[idx_train]
         self.idx_train = self.idx_train[self.idx_train > -1]
         self.idx_val = idxnew[idx_val]
@@ -63,7 +61,7 @@ class DataProcess_PyGFlickr(DataProcess):
         super().__init__(name, path=path, rrz=rrz, seed=seed)
 
     def fetch(self):
-        # ============== 本地文件读取逻辑：完全保留（无框架依赖） ==============
+    
         root = '/share/data/dataset/PyG/Flickr/raw'
         f = np.load(os.path.join(root, 'adj_full.npz'))
         self.adj_matrix = sp.csr_matrix((f['data'], f['indices'], f['indptr']), f['shape'])
@@ -91,7 +89,7 @@ class DataProcess_PyG(DataProcess):
         super().__init__(name, path=path, rrz=rrz, seed=seed)
 
     def fetch(self):
-        # ============== 原版：PyG → 重写为 GammaGL 数据集 ==============
+      
         dataset = ggl_ds.Coauthor(root='/share/data/dataset/PyG/Coauthor', name='CS', transform=ggl_t.ToUndirected())
         graph = dataset[0]
         degree = ggl_utils.degree(graph.edge_index[0], graph.num_nodes).numpy()
@@ -110,7 +108,7 @@ class DataProcess_PyG(DataProcess):
 
 # ====================
 if __name__ == '__main__':
-    # 调用方式和原版完全一致
+   
     ds = DataProcess_OGB('ogbn-papers100M', path='/share/data/dataset/SCARA')
     # ds = DataProcess_PyGFlickr('flickr', path='/share/data/dataset/SCARA')
     # ds = DataProcess_PyG('cs', path='/share/data/dataset/SCARA')
@@ -119,5 +117,5 @@ if __name__ == '__main__':
     ds.calculate(['deg', 'idx_train',])
     print(ds)
     os.makedirs(os.path.join(ds.path, ds.name), exist_ok=False)
-    # 输出格式和原版完全一致（adjnpz/txt/特征/标签）
+   
     ds.output(['adjtxt', 'adjnpz', 'adjl', 'attr_matrix', 'deg', 'labels', 'attribute'])

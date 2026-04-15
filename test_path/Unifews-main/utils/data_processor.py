@@ -346,7 +346,7 @@ class DataProcess(object):
                 # assert self.adj_matrix.diagonal().sum() == 0, "adj_matrix error"
             elif key == 'deg':
                 #self.deg = dict(np.load(self.degree_path))['arr_0']
-                # 替换你第 348~349 行左右的 deg 读取代码
+              
                 data = np.load(self.degree_path, allow_pickle=True)
                 self.deg = data[next(iter(data.keys()))]
             elif key == 'labels':

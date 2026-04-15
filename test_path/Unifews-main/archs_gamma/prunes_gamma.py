@@ -4,14 +4,12 @@ import tensorlayerx as tlx
 from tensorlayerx.nn import Module
 from abc import ABC, abstractmethod
 
-# ===================== 你的原版代码，完全不动 =====================
 def safe_norm(x, p=2, axis=None, keepdims=False):
     x_abs = tlx.abs(x)
     if p == 1:
         return tlx.reduce_sum(x_abs, axis=axis, keepdims=keepdims)
     return tlx.sqrt(tlx.reduce_sum(x_abs * x_abs, axis=axis, keepdims=keepdims))
 
-# ===================== 你的原版BasePruningMethod，完全不动 =====================
 class BasePruningMethod(ABC):
     PRUNING_TYPE = 'unstructured'
     _tensor_name: str = None
@@ -67,7 +65,6 @@ class BasePruningMethod(ABC):
                 if hasattr(module, attr):
                     delattr(module, attr)
 
-# ===================== 【修复】RandomUnstructured（纯TLX API，无clone） =====================
 class RandomUnstructured(BasePruningMethod):
     PRUNING_TYPE = "unstructured"
 
@@ -80,19 +77,17 @@ class RandomUnstructured(BasePruningMethod):
         nparams_toprune = self._get_prune_count(self.amount, tensor_size)
         nparams_toprune = max(0, min(nparams_toprune, tensor_size))
         
-        # 🔥 修复1：TLX无clone，用 ones_like + 赋值 实现克隆（原生兼容）
+
         mask = tlx.ones_like(default_mask)
 
         if nparams_toprune != 0:
-            # 纯TLX随机数
+            
             prob = tlx.random_uniform(shape=tlx.get_tensor_shape(t), dtype=t.dtype)
             flat_prob = tlx.reshape(prob, (-1,))
-            # TLX取最小K个值
+        
             _, topk_indices = tlx.topk(flat_prob, k=nparams_toprune, largest=False)
-            
-            # 🔥 修复2：TLX张量赋值（兼容所有后端）
             flat_mask = tlx.reshape(mask, (-1,))
-            # 生成零张量并赋值到指定索引
+            
             flat_mask = tlx.scatter_update(flat_mask, topk_indices, tlx.zeros_like(topk_indices, dtype=flat_mask.dtype))
             mask = tlx.reshape(flat_mask, tlx.get_tensor_shape(default_mask))
 
@@ -113,7 +108,6 @@ class RandomUnstructured(BasePruningMethod):
             return amount
         return int(amount * tensor_size)
 
-# ===================== 你的原版prune类，完全不动 =====================
 class prune:
     @staticmethod
     def is_pruned(module: Module) -> bool:
@@ -128,7 +122,6 @@ class prune:
 
     RandomUnstructured = RandomUnstructured
 
-# ===================== 你的原版工具函数，完全不动 =====================
 def prune_threshold(x, threshold=1e-3):
     norm_vals = safe_norm(x, axis=1) / x.shape[1]
     idx_0 = norm_vals < threshold
@@ -154,7 +147,6 @@ def rewind(module: Module, name: str):
         for k in hooks_to_del:
             del module._forward_pre_hooks[k]
 
-# ===================== 你的原版剪枝类，完全不动 =====================
 class ThrInPrune(BasePruningMethod):
     PRUNING_TYPE = 'structured'
     def __init__(self, threshold, dim=0):

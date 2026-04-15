@@ -12,15 +12,7 @@ from tensorlayerx import nn
 from tensorlayerx.dataflow import Dataset, DataLoader
 from tensorlayerx.model import WithLoss, TrainOneStep
 
-# ====================== 【修复】PURE TLX ADAM OPTIMIZER（解决索引越界） ======================
-# 修复：强制m/v长度和权重完全匹配，永远不会出现IndexError
-# ====================== 【终极无错版】PURE TLX ADAM OPTIMIZER ======================
-# 修复：禁止原地操作 + 非叶子张量更新 + 适配PyTorch(TLX)梯度规则
-# ====================== 【纯TLX·终极无错版】ADAM优化器 ======================
-# 100%无torch、无no_grad、纯TLX、修复所有报错
-# ====================== 【终极·零报错·纯TLX】ADAM优化器 ======================
-# ✅ 绝对不导入torch | ✅ 无assign方法 | ✅ 无no_grad | ✅ 修复所有历史报错
-# ✅ 适配旧版TLX | ✅ 纯TLX API | ✅ 兼容TrainOneStep
+
 class PureTLXAdam:
     def __init__(self, lr=0.001, weight_decay=0.0):
         self.lr = lr
@@ -33,11 +25,10 @@ class PureTLXAdam:
         self.epsilon = 1e-7
 
     def gradient(self, loss, weights):
-        # TLX原生触发反向传播
+        
         if hasattr(loss, 'backward'):
             loss.backward()
         
-        # 严格匹配权重长度获取梯度
         grads = []
         for w in weights:
             grad = w.grad if hasattr(w, 'grad') else tlx.zeros_like(w)
@@ -45,7 +36,7 @@ class PureTLXAdam:
         return grads
 
     def apply_gradients(self, grads_and_vars):
-        # 修复1：zip迭代器转列表，解决len()报错
+       
         grads_and_vars = list(grads_and_vars)
         if not grads_and_vars:
             return
@@ -54,32 +45,29 @@ class PureTLXAdam:
         bias_correction1 = 1.0 - self.beta1**self.t
         bias_correction2 = 1.0 - self.beta2**self.t
         step_size = self.lr * (bias_correction2**0.5) / bias_correction1
-        
-        # 修复2：动态初始化动量，解决索引越界
+       
         if len(self.m) != len(grads_and_vars):
             self.m = [tlx.zeros_like(v) for g, v in grads_and_vars]
             self.v = [tlx.zeros_like(v) for g, v in grads_and_vars]
         
-        # 修复3：操作.data属性（TLX参数自带），无原地操作报错、无assign、无torch
         for i, (g, p) in enumerate(grads_and_vars):
             if g is None:
                 continue
             
-            # 权重衰减
+            
             if self.weight_decay != 0:
                 g = g + self.weight_decay * p
             
-            # 更新动量
+           
             self.m[i] = self.beta1 * self.m[i] + (1.0 - self.beta1) * g
             self.v[i] = self.beta2 * self.v[i] + (1.0 - self.beta2) * (g * g)
             
-            # 计算更新量
+
             update = step_size * (self.m[i] / (tlx.sqrt(self.v[i]) + self.epsilon))
             
-            # 【核心·终极修复】操作参数.data属性（TLX兼容，无任何报错）
+          
             p.data -= update
             
-            # 清空梯度
             if hasattr(p, 'grad') and p.grad is not None:
                 p.grad = None
 # =====================================================================

@@ -5,36 +5,27 @@ import tensorlayerx as tlx
 import tensorlayerx.nn as nn
 from .prunes_gamma import prune, rewind, ThrInPrune, ThrProdPrune
 
-# 【已修复·无assign·纯TLX兼容】BatchNorm重置函数
 def reset_bn_(bn_module):
-    """
-    纯TLX实现：重置BatchNorm1d参数
-    复用run_mb_gamma.py亲测稳定的 .data 赋值方式，无assign报错
-    """
+    
     if bn_module is None:
         return
 
-    # 重置 gamma (weight) = 1 → 用 .data 赋值（亲测可用）
     if hasattr(bn_module, 'weight') and bn_module.weight is not None:
         new_gamma = tlx.initializers.Ones()(bn_module.weight.shape)
         bn_module.weight.data = new_gamma
 
-    # 重置 beta (bias) = 0 → 用 .data 赋值
     if hasattr(bn_module, 'bias') and bn_module.bias is not None:
         new_beta = tlx.initializers.Zeros()(bn_module.bias.shape)
         bn_module.bias.data = new_beta
 
-    # 重置 moving_mean = 0 → 用 .data 赋值
     if hasattr(bn_module, 'moving_mean') and bn_module.moving_mean is not None:
         new_mean = tlx.initializers.Zeros()(bn_module.moving_mean.shape)
         bn_module.moving_mean.data = new_mean
 
-    # 重置 moving_var = 1 → 用 .data 赋值
     if hasattr(bn_module, 'moving_var') and bn_module.moving_var is not None:
         new_var = tlx.initializers.Ones()(bn_module.moving_var.shape)
         bn_module.moving_var.data = new_var
-        
-# IMPORT YOUR CUSTOM FUNCTIONS HERE:
+    
 from .layers_gamma import (
     layer_dict, ThrInPrune, LayerNumLogger, rewind, 
     reset_weight_, reset_bias_, 
@@ -112,14 +103,12 @@ class SandwitchGCNII(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.use_bn = True
         
-        # 1. 投影层
         self.lin_in = nn.Linear(in_features=nfeat, out_features=nhidden)
         self.lin_out = nn.Linear(in_features=nhidden, out_features=nclass)
         
         for lin in [self.lin_in, self.lin_out]:
             object.__setattr__(lin, 'act', lambda x: x)
 
-        # 2. 动态选择卷积层类型 (关键修复：不再硬编码 'gcn2')
         Conv = layer_dict[layer] 
         
         self.convs = nn.ModuleList()
@@ -155,7 +144,7 @@ class SandwitchGCNII(nn.Module):
             reset_bn_(norm)
 
     def forward(self, x, edge_idx, **kwargs):
-        # 默认 forward 不包含复杂的剪枝逻辑，由子类重写
+       
         x = self.lin_in(x)
         x = x_0 = self.act(x)
         x = self.dropout(x)
@@ -184,13 +173,11 @@ class GNNThr(nn.Module):
         self.use_bn = True
         self.kwargs = kwargs
 
-        # 1. 基础配置
         Conv = layer_dict[layer]
         layer_base = layer.split('_')[0]
         for k, v in kwargs_default[layer_base].items():
             self.kwargs.setdefault(k, v)
 
-        # 🔥 仅GAT处理多头
         self.is_gat = layer_base.startswith('gat')
         if self.is_gat:
             self.heads = self.kwargs['heads']
@@ -199,22 +186,18 @@ class GNNThr(nn.Module):
         else:
             self.feat_dim = nhidden
 
-        # 剪枝参数
         thr_a = [thr_a] * nlayer if not isinstance(thr_a, list) else thr_a
         thr_w = [thr_w] * nlayer if not isinstance(thr_w, list) else thr_w
 
-        # 中间层参数 → GAT保留 heads/concat，其他模型清理
         self.depth_inv = self.kwargs.pop('depth_inv', False)
         self.normalize_adj = self.kwargs.pop('normalize', False)
         self.add_self_loops = self.kwargs.pop('add_self_loops', False)
         self.cached = self.kwargs.pop('cached', False)
-        
-        # 只清理非注意力参数，GAT保留 heads/concat
+      
         self.mid_kwargs = self.kwargs.copy()
         for k in ['improved', 'rnorm', 'diag']:
             self.mid_kwargs.pop(k, None)
 
-        # 最后层参数（所有模型清理+GAT强制单头）
         self.final_kwargs = self.mid_kwargs.copy()
         for k in ['heads', 'concat']:
             self.final_kwargs.pop(k, None)
@@ -222,11 +205,9 @@ class GNNThr(nn.Module):
             self.final_kwargs['heads'] = 1
             self.final_kwargs['concat'] = False
 
-        # 3. 网络初始化
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
 
-        # 中间层：GAT用带heads的参数，输出4096维
         self.convs.append(Conv(nfeat, nhidden, thr_a=thr_a[0], thr_w=thr_w[0], **self.mid_kwargs))
         self.norms.append(nn.BatchNorm1d(num_features=self.feat_dim, momentum=0.1))
         
@@ -234,11 +215,9 @@ class GNNThr(nn.Module):
             self.convs.append(Conv(nhidden, nhidden, thr_a=thr_a[i], thr_w=thr_w[i], **self.mid_kwargs))
             self.norms.append(nn.BatchNorm1d(num_features=self.feat_dim, momentum=0.1))
 
-        # 最后层：GAT单头输出
         final_in = self.feat_dim if self.is_gat else nhidden
         self.convs.append(Conv(final_in, nclass, thr_a=thr_a[-1], thr_w=thr_w[-1], **self.final_kwargs))
 
-    # ========== 以下代码完全不变，直接复制 ==========
     def reset_parameters(self):
         for conv in self.convs:
             if hasattr(conv, 'reset_parameters'):
@@ -352,7 +331,7 @@ class SandwitchThr(SandwitchGCNII):
         beta = kwargs.get('beta', 0.5)
         variant = kwargs.get('variant', False)
         
-        # 显式传递 layer 参数，父类会根据此参数加载 GCNIIConvThr
+        
         super().__init__(nlayer=nlayer, nfeat=nfeat, nhidden=nhidden, nclass=nclass, 
                          alpha=alpha, beta=beta, thr_a=thr_a, thr_w=thr_w, 
                          dropout=dropout, variant=variant, layer=layer, **kwargs)
@@ -381,7 +360,7 @@ class SandwitchThr(SandwitchGCNII):
 
         if self.apply_thr:
             for i, conv in enumerate(self.convs):
-                # 此时 conv 是 GCNIIConvThr，支持 node_lock
+
                 x, edge_idx = conv(x, x_0, edge_idx, node_lock=node_lock, verbose=verbose)
                 if self.use_bn: x = self.norms[i](x)
                 x = self.act(x)

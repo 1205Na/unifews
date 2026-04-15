@@ -7,7 +7,7 @@ do
             OUTDIR=./save/${DATASTR}/${ALGO}/${SEED}-0.0e+00-0.0e+00
             mkdir -p ${OUTDIR}
             OUTFILE=${OUTDIR}/out.txt
-            python -u run_fb.py --seed ${SEED} --config ./config/${DATASTR}.json --dev ${1:--1} \
+            python -u run_fb_gamma.py --seed ${SEED} --config ./config/${DATASTR}.json --dev ${1:--1} \
                 --algo ${ALGO} >> ${OUTFILE} &
             echo $! && wait
         done
