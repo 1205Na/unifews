@@ -78,8 +78,8 @@ class PureTLXAdam:
 from utils.logger_gamma import Logger, ModelLogger, prepare_opt
 from utils.loader_gamma import load_embedding
 import utils.metric_gamma as metric
-from archs_gamma import flops_modules_dict
-import archs_gamma.models_gamma as models
+from arch_mini import flops_modules_dict
+import arch_mini.mlp_model as models
 
 np.set_printoptions(linewidth=160, edgeitems=5, threshold=20,
                     formatter=dict(float=lambda x: "%.6e" % x))
