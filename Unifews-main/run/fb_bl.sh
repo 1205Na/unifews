@@ -1,4 +1,4 @@
-for ALGO in gcn gat
+for ALGO in gsage gcn2
 do
     for DATASTR in cora citeseer pubmed
     do

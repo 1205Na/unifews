@@ -1,4 +1,4 @@
-ALGO=gat_thr
+ALGO=gat_thr #gcn_thr gsage_thr
 for DATASTR in cora citeseer pubmed
 do
     # for THRA in 0.0e+00 5.0e-02 #1.0e-01 2.0e-01 3.0e-01 4.0e-01 5.0e-01 6.0e-01 7.0e-01 8.0e-01 9.0e-01 1.0e+00 1.1e+00 1.2e+00 1.5e+00 2.0e+00  # gcn_thr
